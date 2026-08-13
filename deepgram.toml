@@ -6,6 +6,7 @@ repository = "https://github.com/deepgram-starters/deno-flux"
 useCase = "flux"
 language = "typescript"
 framework = "deno"
+sdk = "@deepgram/sdk"
 tags = ["flux", "streaming", "speech-to-text", "real-time", "turn-detection", "deno", "typescript"]
 
 [check]

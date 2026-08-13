@@ -15,6 +15,7 @@
 import { load } from "dotenv";
 import TOML from "npm:@iarna/toml@2.2.5";
 import * as jose from "jose";
+import { DeepgramClient } from "@deepgram/sdk";
 
 // Load environment variables
 await load({ export: true });
@@ -22,11 +23,6 @@ await load({ export: true });
 // ============================================================================
 // CONFIGURATION - Customize these values for your needs
 // ============================================================================
-
-/**
- * Deepgram Flux WebSocket URL (v2 endpoint)
- */
-const DEEPGRAM_WS_URL = "wss://api.deepgram.com/v2/listen";
 
 /**
  * Server configuration - These can be overridden via environment variables
@@ -108,6 +104,37 @@ function loadApiKey(): string {
 const apiKey = loadApiKey();
 
 // ============================================================================
+// DEEPGRAM SDK CLIENT
+// ============================================================================
+
+// A single SDK client is reused across connections; auth is resolved from the
+// API key here, so the browser never sees it.
+//
+// DEEPGRAM_BASE_URL (e.g. a staging host like wss://api.staging.deepgram.com)
+// overrides the default production endpoint. The Flux (listen v2) websocket uses
+// `environment.production`, so we set that plus the REST `base`.
+const baseUrl = Deno.env.get("DEEPGRAM_BASE_URL");
+const httpBase = baseUrl
+  ?.replace(/^wss:\/\//, "https://")
+  .replace(/^ws:\/\//, "http://");
+const deepgram = new DeepgramClient({
+  apiKey,
+  ...(baseUrl && httpBase
+    ? {
+        environment: {
+          base: httpBase,
+          production: baseUrl,
+          agent: baseUrl,
+          agentRest: httpBase,
+        },
+      }
+    : {}),
+});
+if (baseUrl) {
+  console.log(`Using custom Deepgram base URL: ${baseUrl}`);
+}
+
+// ============================================================================
 // CORS CONFIGURATION
 // ============================================================================
 
@@ -137,36 +164,28 @@ interface ErrorMessage {
 // ============================================================================
 
 /**
- * Build Deepgram Flux WebSocket URL with query parameters
- * Model is hardcoded to flux-general-en
+ * Build Deepgram Flux (listen v2) options from the client's query params.
+ * Model is hardcoded to flux-general-en. These are passed to
+ * `deepgram.listen.v2.createConnection({ ... })`; the SDK serializes them onto
+ * the websocket query string (arrays are repeated, e.g. keyterm).
  */
-function buildDeepgramUrl(queryParams: URLSearchParams): string {
-  const model = "flux-general-en";
-  const encoding = queryParams.get("encoding") || "linear16";
-  const sampleRate = queryParams.get("sample_rate") || "16000";
-
-  const deepgramUrl = new URL(DEEPGRAM_WS_URL);
-  deepgramUrl.searchParams.set("model", model);
-  deepgramUrl.searchParams.set("encoding", encoding);
-  deepgramUrl.searchParams.set("sample_rate", sampleRate);
-
-  // Optional Flux-specific parameters
+function buildFluxOptions(queryParams: URLSearchParams) {
   const eotThreshold = queryParams.get("eot_threshold");
-  if (eotThreshold) deepgramUrl.searchParams.set("eot_threshold", eotThreshold);
-
   const eagerEotThreshold = queryParams.get("eager_eot_threshold");
-  if (eagerEotThreshold) deepgramUrl.searchParams.set("eager_eot_threshold", eagerEotThreshold);
-
   const eotTimeoutMs = queryParams.get("eot_timeout_ms");
-  if (eotTimeoutMs) deepgramUrl.searchParams.set("eot_timeout_ms", eotTimeoutMs);
-
-  // Multi-value keyterm support
   const keyterms = queryParams.getAll("keyterm");
-  for (const term of keyterms) {
-    deepgramUrl.searchParams.append("keyterm", term);
-  }
 
-  return deepgramUrl.toString();
+  return {
+    model: "flux-general-en",
+    encoding: queryParams.get("encoding") || "linear16",
+    sample_rate: queryParams.get("sample_rate") || "16000",
+    // Optional Flux-specific end-of-turn tuning
+    ...(eotThreshold ? { eot_threshold: Number(eotThreshold) } : {}),
+    ...(eagerEotThreshold ? { eager_eot_threshold: Number(eagerEotThreshold) } : {}),
+    ...(eotTimeoutMs ? { eot_timeout_ms: Number(eotTimeoutMs) } : {}),
+    // Multi-value keyterm support (serialized as repeated query params)
+    ...(keyterms.length > 0 ? { keyterm: keyterms } : {}),
+  };
 }
 
 /**
@@ -191,96 +210,161 @@ function sendError(socket: WebSocket, error: Error, code: string = "UNKNOWN_ERRO
  * Handle Flux WebSocket connection
  * Establishes bidirectional proxy between client and Deepgram Flux API
  */
+type FluxConnection = Awaited<
+  ReturnType<typeof deepgram.listen.v2.createConnection>
+>;
+
+type PendingMessage =
+  | { binary: true; data: ArrayBuffer }
+  | { binary: false; msg: Record<string, unknown> };
+
 async function handleFlux(
   clientSocket: WebSocket,
   queryParams: URLSearchParams
 ) {
   console.log("Client connected to /api/flux");
 
-  let deepgramWs: WebSocket | null = null;
+  // Ensure binary audio frames arrive as ArrayBuffer so we can forward them
+  // straight to the SDK's sendMedia().
+  clientSocket.binaryType = "arraybuffer";
 
+  const options = buildFluxOptions(queryParams);
+  console.log("Connecting to Deepgram Flux:", options);
+
+  // Buffer any browser messages that arrive before the Deepgram socket is open.
+  let dgReady = false;
+  const pending: PendingMessage[] = [];
+
+  // Create the Deepgram Flux (listen v2) connection object (not yet connected).
+  let dgConn: FluxConnection;
   try {
-    // Build Deepgram Flux WebSocket URL with parameters
-    const deepgramUrl = buildDeepgramUrl(queryParams);
-    console.log("Connecting to Deepgram Flux:", deepgramUrl);
-
-    // Connect to Deepgram with authorization
-    deepgramWs = new WebSocket(deepgramUrl, {
-      headers: {
-        Authorization: `Token ${apiKey}`,
-      },
-    });
-
-    // Wait for Deepgram connection to open
-    await new Promise((resolve, reject) => {
-      if (!deepgramWs) return reject(new Error("deepgramWs is null"));
-
-      deepgramWs.onopen = () => {
-        console.log("✓ Connected to Deepgram Flux API");
-        resolve(null);
-      };
-
-      deepgramWs.onerror = (err) => {
-        console.error("Deepgram Flux connection error:", err);
-        reject(new Error("Failed to connect to Deepgram Flux"));
-      };
-    });
-
-    // Forward messages from client to Deepgram (audio data)
-    clientSocket.onmessage = (event) => {
-      if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN) {
-        deepgramWs.send(event.data);
-      }
-    };
-
-    // Forward messages from Deepgram to client (transcription results)
-    deepgramWs.onmessage = (event) => {
-      if (clientSocket.readyState === WebSocket.OPEN) {
-        clientSocket.send(event.data);
-      }
-    };
-
-    // Handle client disconnect
-    clientSocket.onclose = () => {
-      console.log("Client disconnected");
-      if (deepgramWs) {
-        deepgramWs.close();
-      }
-    };
-
-    // Handle client errors
-    clientSocket.onerror = (err) => {
-      console.error("Client WebSocket error:", err);
-      if (deepgramWs) {
-        deepgramWs.close();
-      }
-    };
-
-    // Handle Deepgram disconnect
-    deepgramWs.onclose = (event) => {
-      console.log(`Deepgram Flux connection closed: ${event.code} ${event.reason}`);
-      if (clientSocket.readyState === WebSocket.OPEN) {
-        clientSocket.close();
-      }
-    };
-
-    // Handle Deepgram errors
-    deepgramWs.onerror = (err) => {
-      console.error("Deepgram Flux WebSocket error:", err);
-      sendError(clientSocket, new Error("Deepgram Flux connection error"), "DEEPGRAM_ERROR");
-      if (clientSocket.readyState === WebSocket.OPEN) {
-        clientSocket.close();
-      }
-    };
-
+    dgConn = await deepgram.listen.v2.createConnection(options);
   } catch (err) {
-    console.error("Error setting up Flux connection:", err);
+    console.error("Failed to create Deepgram Flux connection:", err);
+    sendError(clientSocket, err as Error, "CONNECTION_FAILED");
+    if (clientSocket.readyState === WebSocket.OPEN) {
+      clientSocket.close(3000, "Failed to reach Deepgram");
+    }
+    return;
+  }
+
+  // Route a control message from the browser to the matching SDK method.
+  const dispatchControl = (msg: Record<string, unknown>) => {
+    try {
+      switch (msg.type) {
+        case "CloseStream":
+          dgConn.sendCloseStream({ type: "CloseStream" });
+          break;
+        default:
+          console.warn("Ignoring unknown client control message type:", msg.type);
+      }
+    } catch (err) {
+      console.error("Failed to forward control message to Deepgram:", err);
+    }
+  };
+
+  // Deepgram -> browser (Flux messages are JSON: Connected / TurnInfo /
+  // EagerEndOfTurn / TurnResumed / FatalError). Re-serialize so the frontend
+  // sees the same JSON it received from the raw socket before.
+  dgConn.on("message", (data) => {
+    if (clientSocket.readyState === WebSocket.OPEN) {
+      clientSocket.send(typeof data === "string" ? data : JSON.stringify(data));
+    }
+  });
+
+  dgConn.on("open", () => {
+    console.log("✓ Connected to Deepgram Flux API");
+  });
+
+  dgConn.on("error", (err) => {
+    console.error("Deepgram Flux socket error:", err);
+    sendError(clientSocket, new Error("Deepgram Flux connection error"), "DEEPGRAM_ERROR");
+    if (clientSocket.readyState === WebSocket.OPEN) {
+      clientSocket.close();
+    }
+  });
+
+  dgConn.on("close", () => {
+    console.log("Deepgram Flux connection closed");
+    if (clientSocket.readyState === WebSocket.OPEN) {
+      clientSocket.close();
+    }
+  });
+
+  // browser -> Deepgram. Binary frames are audio; text frames are JSON control.
+  clientSocket.onmessage = (event) => {
+    const data = event.data;
+
+    if (data instanceof ArrayBuffer) {
+      if (!dgReady) {
+        pending.push({ binary: true, data });
+        return;
+      }
+      try {
+        dgConn.sendMedia(data);
+      } catch (err) {
+        console.error("Failed to send audio to Deepgram:", err);
+      }
+      return;
+    }
+
+    // Text frame — a JSON control message.
+    let msg: Record<string, unknown>;
+    try {
+      msg = JSON.parse(typeof data === "string" ? data : "");
+    } catch {
+      console.warn("Ignoring non-JSON text message from client");
+      return;
+    }
+    if (!dgReady) {
+      pending.push({ binary: false, msg });
+      return;
+    }
+    dispatchControl(msg);
+  };
+
+  // Handle client disconnect
+  clientSocket.onclose = () => {
+    console.log("Client disconnected");
+    try {
+      dgConn.close();
+    } catch {
+      // already closed
+    }
+  };
+
+  // Handle client errors
+  clientSocket.onerror = (err) => {
+    console.error("Client WebSocket error:", err);
+    try {
+      dgConn.close();
+    } catch {
+      // already closed
+    }
+  };
+
+  // Open the Deepgram connection and flush anything the browser sent early.
+  try {
+    dgConn.connect();
+    await dgConn.waitForOpen();
+    dgReady = true;
+    for (const item of pending) {
+      if (item.binary) {
+        try {
+          dgConn.sendMedia(item.data);
+        } catch (err) {
+          console.error("Failed to send buffered audio to Deepgram:", err);
+        }
+      } else {
+        dispatchControl(item.msg);
+      }
+    }
+    pending.length = 0;
+  } catch (err) {
+    console.error("Deepgram Flux connection did not open:", err);
     sendError(clientSocket, err as Error, "CONNECTION_FAILED");
     if (clientSocket.readyState === WebSocket.OPEN) {
       clientSocket.close(3000, "Setup failed");
-    }
-    if (deepgramWs) {
-      deepgramWs.close();
     }
   }
 }
